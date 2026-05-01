@@ -6,19 +6,8 @@ from PIL import Image
 from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
-
-# Адаптивный импорт DuckDuckGo
-try:
-    from duckduckgo_search import AsyncDDGS
-    ASYNC_DDGS_AVAILABLE = True
-except ImportError:
-    try:
-        from duckduckgo_search import DDGS
-        ASYNC_DDGS_AVAILABLE = False
-    except ImportError:
-        DDGS = None
-        ASYNC_DDGS_AVAILABLE = False
-        logging.error("duckduckgo_search не установлена")
+from bs4 import BeautifulSoup
+import httpx
 
 from aiogram import Bot, Dispatcher, types as aiog_types, F
 from aiogram.filters import Command
@@ -49,7 +38,7 @@ deepseek_client = AsyncOpenAI(
     base_url="https://api.deepseek.com/v1"
 )
 
-# ========== БД ==========
+# ========== БАЗА ДАННЫХ ==========
 class Registration(StatesGroup):
     waiting_for_bot_name = State()
 
@@ -77,7 +66,6 @@ async def update_user(user_id, bot_name=None, history=None):
         if bot_name is not None:
             await db.execute("UPDATE users SET bot_name = ? WHERE user_id = ?", (bot_name, user_id))
         if history is not None:
-            # Обрезаем историю, если она слишком длинная
             if len(history) > MAX_HISTORY_SYMBOLS:
                 history = history[-MAX_HISTORY_SYMBOLS:]
             await db.execute("UPDATE users SET history = ? WHERE user_id = ?", (history, user_id))
@@ -99,52 +87,33 @@ bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 search_users = set()
 
-# ========== ПОИСК В ИНТЕРНЕТЕ (АДАПТИВНЫЙ) ==========
+# ========== ИСПРАВЛЕННЫЙ ПОИСК ЧЕРЕЗ ПРЯМОЙ HTML-ЗАПРОС ==========
 async def search_internet(query: str) -> str:
-    if not ASYNC_DDGS_AVAILABLE and DDGS is None:
-        return ""
+    search_url = "https://html.duckduckgo.com/html/"
+    params = {"q": query}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
+    }
     try:
-        if ASYNC_DDGS_AVAILABLE:
-            async def _async_search():
-                async with AsyncDDGS() as ddgs:
-                    results = []
-                    async for r in ddgs.atext(query, max_results=3):
-                        if not isinstance(r, dict):
-                            continue
-                        title = str(r.get('title', ''))[:100].strip()
-                        body = str(r.get('body', ''))[:150].strip()
-                        if title and body:
-                            results.append(f"• {title}\n  {body}\n\n")
-                        if len(results) >= 3:
-                            break
-                    return "".join(results)
-            search_result = await asyncio.wait_for(_async_search(), timeout=SEARCH_TIMEOUT)
-        else:
-            def _sync_search():
-                with DDGS() as ddgs:
-                    results = []
-                    for r in ddgs.text(query, max_results=3):
-                        if not isinstance(r, dict):
-                            continue
-                        title = str(r.get('title', ''))[:100].strip()
-                        body = str(r.get('body', ''))[:150].strip()
-                        if title and body:
-                            results.append(f"• {title}\n  {body}\n\n")
-                        if len(results) >= 3:
-                            break
-                    return "".join(results)
-            search_result = await asyncio.wait_for(
-                asyncio.to_thread(_sync_search),
-                timeout=SEARCH_TIMEOUT
-            )
-        if search_result:
-            return "📱 Информация из интернета:\n" + search_result
+        async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT, follow_redirects=True) as client:
+            response = await client.get(search_url, params=params, headers=headers)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            results = soup.find_all("div", class_="result")
+            collected = []
+            for r in results[:3]:
+                title_elem = r.find("a", class_="result__a")
+                snippet_elem = r.find("a", class_="result__snippet")
+                title = title_elem.text.strip() if title_elem else "Без заголовка"
+                snippet = snippet_elem.text.strip() if snippet_elem else "Нет описания"
+                if title and snippet:
+                    collected.append(f"• {title}\n  {snippet}\n")
+            if collected:
+                return "📱 Информация из интернета:\n" + "\n".join(collected)
+            return ""
+    except httpx.TimeoutException:
+        logging.warning(f"Таймаут поиска: {query[:50]}")
         return ""
-    except asyncio.TimeoutError:
-        logging.warning(f"Поиск прерван по таймауту: {query[:50]}")
-        return ""
-    except asyncio.CancelledError:
-        raise
     except Exception as e:
         logging.error(f"Ошибка поиска: {e}")
         return ""
@@ -157,14 +126,13 @@ async def safe_send(message: aiog_types.Message, text: str, keyboard=None):
     if len(text) <= MAX_REPLY_LEN:
         await message.answer(text, reply_markup=keyboard)
         return
-    # Разбиваем по частям
     for i in range(0, len(text), MAX_REPLY_LEN):
         part = text[i:i+MAX_REPLY_LEN]
-        await message.answer(part, reply_markup=keyboard if i+MAX_REPLY_LEN >= len(text) else None)
+        kb = keyboard if i + MAX_REPLY_LEN >= len(text) else None
+        await message.answer(part, reply_markup=kb)
         await asyncio.sleep(0.2)
 
 # ========== МОДЕЛИ ==========
-# АСИНХРОННЫЙ ВЫЗОВ GEMINI (исправлено!)
 async def ask_gemini(contents):
     try:
         response = await gemini_client.aio.models.generate_content(
@@ -200,7 +168,7 @@ async def ask_deepseek(messages):
         logging.error(f"DeepSeek error: {e}")
         return None
 
-# ========== КОМАНДЫ И КНОПКИ ==========
+# ========== ОБРАБОТЧИКИ КОМАНД И КНОПОК ==========
 @dp.message(Command("start"))
 async def cmd_start(message: aiog_types.Message, state: FSMContext):
     user_data = await get_user_data(message.from_user.id)
@@ -348,7 +316,6 @@ async def universal_handler(message: aiog_types.Message, state: FSMContext):
                 if not ai_reply:
                     ai_reply = "❌ Не удалось получить ответ от Gemini по этому изображению."
 
-                # Сохраняем историю для фото
                 if not in_search:
                     new_history = f"{history}\nU: [ФОТО] {user_text}\nA: {ai_reply}"
                     if len(new_history) > MAX_HISTORY_SYMBOLS:
@@ -363,7 +330,6 @@ async def universal_handler(message: aiog_types.Message, state: FSMContext):
             if not user_text:
                 return
 
-            # Ключевые слова для автоматического поиска
             search_keywords = ["что", "как", "где", "когда", "почему", "какой",
                                "новости", "информация", "событие", "последние",
                                "актуальное", "сейчас", "погода", "курс", "сколько",
@@ -374,7 +340,6 @@ async def universal_handler(message: aiog_types.Message, state: FSMContext):
             if need_search:
                 search_context = await search_internet(user_text)
 
-            # Формируем промпт
             context_text = f"{persona}\n\n"
             if search_context:
                 context_text += f"{search_context}\n"
@@ -391,7 +356,6 @@ async def universal_handler(message: aiog_types.Message, state: FSMContext):
             if not ai_reply:
                 ai_reply = f"Привет, я {bot_name}. Сейчас я не могу обработать запрос. Попробуйте позже."
 
-            # Обновляем историю
             if not in_search:
                 new_history = f"{history}\nU: {user_text}\nA: {ai_reply}"
                 if len(new_history) > MAX_HISTORY_SYMBOLS:
