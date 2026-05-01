@@ -2,10 +2,17 @@ import asyncio
 import logging
 import aiosqlite
 import io
+import time
 from PIL import Image
 from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
+
+try:
+    from duckduckgo_search import DDGS
+except ImportError:
+    logging.error("duckduckgo_search not installed")
+    DDGS = None
 
 from aiogram import Bot, Dispatcher, types as aiog_types, F
 from aiogram.filters import Command
@@ -79,22 +86,99 @@ dp = Dispatcher(storage=MemoryStorage())
 
 search_users = set()
 
+async def search_internet(query):
+    """Поиск информации в интернете через DuckDuckGo"""
+    if not DDGS:
+        logging.warning("DDGS not available")
+        return ""
+    
+    try:
+        def perform_search():
+            try:
+                ddgs = DDGS()
+                # Ограничиваем время поиска
+                results = []
+                for i, result in enumerate(ddgs.text(query, max_results=3)):
+                    if i >= 3:
+                        break
+                    results.append(result)
+                return results
+            except Exception as e:
+                logging.error(f"DDGS search error: {e}")
+                return []
+        
+        results = await asyncio.to_thread(perform_search)
+        
+        if not results:
+            return ""
+        
+        search_context = "📱 Информация из интернета:\n"
+        count = 0
+        
+        for result in results:
+            try:
+                if not isinstance(result, dict):
+                    continue
+                    
+                title = str(result.get('title', '')).strip()[:100]
+                body = str(result.get('body', '')).strip()[:150]
+                
+                if not title or not body:
+                    continue
+                
+                search_context += f"• {title}\n  {body}\n\n"
+                count += 1
+                
+            except Exception as e:
+                logging.error(f"Error processing search result: {e}")
+                continue
+        
+        if count == 0:
+            return ""
+            
+        return search_context
+        
+    except Exception as e:
+        logging.error(f"Search internet error: {e}")
+        return ""
+
 async def ask_gemini(contents):
-    response = await asyncio.to_thread(
-        gemini_client.models.generate_content,
-        model="gemini-1.5-flash",
-        contents=contents
-    )
-    return response.text.strip()
+    try:
+        def call_gemini():
+            try:
+                response = gemini_client.models.generate_content(
+                    model="gemini-1.5-flash",
+                    contents=contents
+                )
+                return response.text.strip() if response.text else None
+            except Exception as e:
+                logging.error(f"Gemini API error: {e}")
+                return None
+        
+        result = await asyncio.to_thread(call_gemini)
+        return result
+    except Exception as e:
+        logging.error(f"Gemini wrapper error: {e}")
+        return None
 
 async def ask_deepseek(messages):
-    response = await deepseek_client.chat.completions.create(
-        model="deepseek-chat",
-        messages=messages,
-        temperature=0.7,
-        max_tokens=1000
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        response = await asyncio.wait_for(
+            deepseek_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=messages,
+                temperature=0.7,
+                max_tokens=1000
+            ),
+            timeout=10.0
+        )
+        return response.choices[0].message.content.strip() if response.choices else None
+    except asyncio.TimeoutError:
+        logging.error("DeepSeek request timed out")
+        return None
+    except Exception as e:
+        logging.error(f"DeepSeek error: {e}")
+        return None
 
 @dp.message(Command("start"))
 async def cmd_start(message: aiog_types.Message, state: FSMContext):
@@ -216,69 +300,105 @@ async def universal_handler(message: aiog_types.Message, state: FSMContext):
     if in_search:
         persona += " Отвечай кратко и только по существу запроса."
 
-    try:
-        if message.photo:
-            photo = message.photo[-1]
-            file_info = await bot.get_file(photo.file_id)
-            if file_info.file_size and file_info.file_size > MAX_IMAGE_SIZE_MB * 1024 * 1024:
-                await message.answer(f"❌ Изображение больше {MAX_IMAGE_SIZE_MB} МБ. Уменьшите размер.")
-                return
-
-            file_io = io.BytesIO()
-            await bot.download_file(file_info.file_path, file_io)
-            file_io.seek(0)
-            try:
-                img = Image.open(file_io)
-            except Exception:
-                await message.answer("❌ Неподдерживаемый формат изображения.")
-                return
-
-            user_text = message.caption if message.caption else "Что на этом фото?"
-            context_text = (
-                f"{persona}\n\nИстория диалога:\n{history}\n\n"
-                f"Пользователь прислал фото и спрашивает: {user_text}"
-            )
-            contents = [context_text, types.Part.from_image(img)]
-            ai_reply = await ask_gemini(contents)
-            await message.answer(ai_reply, reply_markup=get_main_keyboard())
-        else:
-            user_text = message.text
-            context_text = (
-                f"{persona}\n\nИстория диалога:\n{history}\n\n"
-                f"Пользователь: {user_text}"
-            )
-
-            ai_reply = None
-            try:
-                ai_reply = await ask_gemini([context_text])
-            except Exception:
-                logging.exception("Gemini failed, falling back to DeepSeek")
-                try:
-                    messages = [
-                        {"role": "system", "content": persona},
-                        {"role": "user", "content": user_text}
-                    ]
-                    ai_reply = await ask_deepseek(messages)
-                except Exception:
-                    logging.exception("DeepSeek also failed")
-                    await message.answer(
-                        "⚠️ Не удалось получить ответ. Попробуйте позже.",
-                        reply_markup=get_main_keyboard()
-                    )
+    async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
+        try:
+            if message.photo:
+                photo = message.photo[-1]
+                file_info = await bot.get_file(photo.file_id)
+                if file_info.file_size and file_info.file_size > MAX_IMAGE_SIZE_MB * 1024 * 1024:
+                    await message.answer(f"❌ Изображение больше {MAX_IMAGE_SIZE_MB} МБ. Уменьшите размер.")
                     return
 
-            if not in_search:
-                new_history = (history + f"\nU: {user_text}\nA: {ai_reply}")[-4000:]
-                await update_user(user_id, history=new_history)
+                file_io = io.BytesIO()
+                await bot.download_file(file_info.file_path, file_io)
+                file_io.seek(0)
+                try:
+                    img = Image.open(file_io)
+                except Exception as e:
+                    logging.error(f"Image processing error: {e}")
+                    await message.answer("❌ Неподдерживаемый формат изображения.")
+                    return
 
-            await message.answer(ai_reply, reply_markup=get_main_keyboard())
+                user_text = message.caption if message.caption else "Что на этом фото?"
+                context_text = (
+                    f"{persona}\n\nИстория диалога:\n{history}\n\n"
+                    f"Пользователь прислал фото и спрашивает: {user_text}"
+                )
+                contents = [context_text, types.Part.from_image(img)]
+                ai_reply = await ask_gemini(contents)
+                
+                if not ai_reply:
+                    ai_reply = "Извините, не удалось обработать изображение. Попробуйте позже."
+                
+                await message.answer(ai_reply, reply_markup=get_main_keyboard())
+            else:
+                user_text = message.text
+                
+                # Автоматический поиск в интернете для информационных запросов
+                search_context = ""
+                keywords = ["что", "как", "где", "когда", "почему", "какой", "новости", "информация", "событие", "последние", "актуальное", "сейчас"]
+                should_search = any(keyword in user_text.lower() for keyword in keywords)
+                
+                if should_search or in_search:
+                    try:
+                        search_context = await search_internet(user_text)
+                    except Exception as e:
+                        logging.error(f"Search failed silently: {e}")
+                        search_context = ""
+                
+                # Формируем контекст с поисковой информацией
+                context_text = f"{persona}\n\n"
+                
+                if search_context:
+                    context_text += f"{search_context}\n"
+                
+                context_text += (
+                    f"История диалога:\n{history}\n\n"
+                    f"Пользователь: {user_text}"
+                )
 
-    except Exception:
-        logging.exception("Critical error in universal handler")
-        await message.answer(
-            "⚠️ Критический сбой. Попробуйте /start.",
-            reply_markup=get_main_keyboard()
-        )
+                ai_reply = None
+                
+                # Пытаемся Gemini
+                try:
+                    ai_reply = await ask_gemini([context_text])
+                except Exception as e:
+                    logging.error(f"Gemini call failed: {e}")
+                
+                # Если Gemini не сработал, пытаемся DeepSeek
+                if not ai_reply:
+                    try:
+                        messages = [
+                            {"role": "system", "content": persona},
+                        ]
+                        if search_context:
+                            messages.append({"role": "system", "content": search_context})
+                        messages.append({"role": "user", "content": user_text})
+                        
+                        ai_reply = await ask_deepseek(messages)
+                    except Exception as e:
+                        logging.error(f"DeepSeek call failed: {e}")
+                
+                # Если оба не сработали, даем простой ответ
+                if not ai_reply or ai_reply.strip() == "":
+                    ai_reply = f"Привет! Я {bot_name}. Сейчас я обрабатываю вашу информацию. Пожалуйста, попробуйте ещё раз."
+
+                # Сохраняем в историю только если не в режиме поиска
+                if not in_search:
+                    try:
+                        new_history = (history + f"\nU: {user_text}\nA: {ai_reply}")[-4000:]
+                        await update_user(user_id, history=new_history)
+                    except Exception as e:
+                        logging.error(f"History update failed: {e}")
+
+                await message.answer(ai_reply, reply_markup=get_main_keyboard())
+
+        except Exception as e:
+            logging.exception(f"Error in universal handler: {e}")
+            await message.answer(
+                "⚠️ Произошла небольшая ошибка. Система восстанавливается...",
+                reply_markup=get_main_keyboard()
+            )
 
 async def main():
     await init_db()
