@@ -1,53 +1,45 @@
 import asyncio
 import logging
-import traceback
 import aiosqlite
 import io
 from PIL import Image
 from google import genai
-from google.genai.types import Part
+from google.genai import types
+from openai import AsyncOpenAI
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types as aiog_types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton
+    ReplyKeyboardMarkup,
+    KeyboardButton
 )
 from aiogram.utils.chat_action import ChatActionSender
 
-# Для повторных попыток при ошибках сети
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
-# --- КОНФИГУРАЦИЯ ---
 TG_TOKEN = "8757845092:AAHK3sKNbzy-w7_4oBgHF7p9sYeNGxIXEic"
 GEMINI_API_KEY = "AIzaSyDJAiv1aUdtqWv8qbMyvuXhfztCJTSQBtU"
+DEEPSEEK_API_KEY = "sk-4c6ad799713d41d8b22f614be5e02264"
 DB_PATH = "simul_core.db"
-MAX_IMAGE_SIZE_MB = 20  # Лимит для обработки фото
+MAX_IMAGE_SIZE_MB = 20
 
 logging.basicConfig(level=logging.INFO)
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+deepseek_client = AsyncOpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com/v1"
+)
 
-# --- СОСТОЯНИЯ ---
 class Registration(StatesGroup):
     waiting_for_bot_name = State()
 
-class SearchMode(StatesGroup):
-    active = State()
-
-# --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                bot_name TEXT,
-                history TEXT
-            )
-        """)
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, bot_name TEXT, history TEXT)"
+        )
         await db.commit()
 
 async def get_user_data(user_id):
@@ -60,15 +52,16 @@ async def get_user_data(user_id):
 
 async def update_user(user_id, bot_name=None, history=None):
     async with aiosqlite.connect(DB_PATH) as db:
-        # Гарантируем существование записи
-        await db.execute("INSERT OR IGNORE INTO users (user_id, bot_name, history) VALUES (?, '', '')", (user_id,))
+        await db.execute(
+            "INSERT OR IGNORE INTO users (user_id, bot_name, history) VALUES (?, '', '')",
+            (user_id,)
+        )
         if bot_name is not None:
             await db.execute("UPDATE users SET bot_name = ? WHERE user_id = ?", (bot_name, user_id))
         if history is not None:
             await db.execute("UPDATE users SET history = ? WHERE user_id = ?", (history, user_id))
         await db.commit()
 
-# --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -81,28 +74,30 @@ def get_main_keyboard():
         one_time_keyboard=False
     )
 
-# --- ИНИЦИАЛИЗАЦИЯ ---
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ВЫЗОВА GEMINI С РЕТРАЕМ ---
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(Exception),
-    reraise=True
-)
-async def generate_with_retry(model, contents):
-    # Выполняем синхронный вызов в потоке
-    return await asyncio.to_thread(
-        client.models.generate_content,
-        model=model,
+search_users = set()
+
+async def ask_gemini(contents):
+    response = await asyncio.to_thread(
+        gemini_client.models.generate_content,
+        model="gemini-1.5-flash",
         contents=contents
     )
+    return response.text.strip()
 
-# --- ОБРАБОТЧИКИ КОМАНД ---
+async def ask_deepseek(messages):
+    response = await deepseek_client.chat.completions.create(
+        model="deepseek-chat",
+        messages=messages,
+        temperature=0.7,
+        max_tokens=1000
+    )
+    return response.choices[0].message.content.strip()
+
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message, state: FSMContext):
+async def cmd_start(message: aiog_types.Message, state: FSMContext):
     user_data = await get_user_data(message.from_user.id)
     if user_data:
         await message.answer(
@@ -116,7 +111,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await state.set_state(Registration.waiting_for_bot_name)
 
 @dp.message(Command("help"))
-async def cmd_help(message: types.Message):
+async def cmd_help(message: aiog_types.Message):
     help_text = (
         "🤖 Справка Simul - BM 100\n\n"
         "/start – запуск\n/help – команды\n\n"
@@ -130,9 +125,8 @@ async def cmd_help(message: types.Message):
     )
     await message.answer(help_text)
 
-# --- РЕГИСТРАЦИЯ ИМЕНИ ---
 @dp.message(Registration.waiting_for_bot_name)
-async def process_reg(message: types.Message, state: FSMContext):
+async def process_reg(message: aiog_types.Message, state: FSMContext):
     if message.text:
         name = message.text.strip()[:20]
         await update_user(message.from_user.id, bot_name=name)
@@ -144,9 +138,8 @@ async def process_reg(message: types.Message, state: FSMContext):
     else:
         await message.answer("Пожалуйста, отправьте текст для имени.")
 
-# --- КНОПКИ МЕНЮ ---
 @dp.message(F.text == "ℹ️ Информация")
-async def btn_info(message: types.Message):
+async def btn_info(message: aiog_types.Message):
     user_data = await get_user_data(message.from_user.id)
     if user_data:
         await message.answer(
@@ -158,21 +151,21 @@ async def btn_info(message: types.Message):
         await message.answer("Система не инициализирована. Используйте /start.", reply_markup=get_main_keyboard())
 
 @dp.message(F.text == "🗑 Очистить память")
-async def btn_reset(message: types.Message):
+async def btn_reset(message: aiog_types.Message):
     await update_user(message.from_user.id, history="")
     await message.answer("🧠 Память очищена.", reply_markup=get_main_keyboard())
 
 @dp.message(F.text == "⚙️ Изменить имя")
-async def btn_change_name(message: types.Message, state: FSMContext):
-    await message.answer("Введите новое имя:", reply_markup=types.ReplyKeyboardRemove())
+async def btn_change_name(message: aiog_types.Message, state: FSMContext):
+    await message.answer("Введите новое имя:", reply_markup=aiog_types.ReplyKeyboardRemove())
     await state.set_state(Registration.waiting_for_bot_name)
 
 @dp.message(F.text == "❓ Помощь")
-async def btn_help(message: types.Message):
+async def btn_help(message: aiog_types.Message):
     await cmd_help(message)
 
 @dp.message(F.text == "📊 Статус системы")
-async def btn_sys_status(message: types.Message):
+async def btn_sys_status(message: aiog_types.Message):
     user_data = await get_user_data(message.from_user.id)
     if user_data:
         await message.answer(
@@ -183,62 +176,52 @@ async def btn_sys_status(message: types.Message):
     else:
         await message.answer("Система не инициализирована. /start", reply_markup=get_main_keyboard())
 
-# --- РЕЖИМ ПОИСКА ---
-search_users = set()
-
 @dp.message(F.text == "Начать поиск")
-async def btn_start_search(message: types.Message, state: FSMContext):
+async def btn_start_search(message: aiog_types.Message):
     search_users.add(message.from_user.id)
-    await message.answer("🔍 Режим поиска активирован. Все ваши запросы теперь будут обрабатываться как поисковые.",
-                         reply_markup=get_main_keyboard())
-    # Отдельный стейт, чтобы отличать от обычного режима (не обязательно, используем множество)
+    await message.answer(
+        "🔍 Режим поиска активирован. Все ваши запросы теперь будут обрабатываться как поисковые.",
+        reply_markup=get_main_keyboard()
+    )
 
 @dp.message(F.text == "Закончить поиск")
-async def btn_end_search(message: types.Message):
+async def btn_end_search(message: aiog_types.Message):
     search_users.discard(message.from_user.id)
-    await message.answer("⏹ Режим поиска остановлен. Вы снова в обычном диалоге.",
-                         reply_markup=get_main_keyboard())
+    await message.answer(
+        "⏹ Режим поиска остановлен. Вы снова в обычном диалоге.",
+        reply_markup=get_main_keyboard()
+    )
 
-# --- ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ ---
 @dp.message()
-async def universal_handler(message: types.Message, state: FSMContext):
-    # Игнорируем сообщения, которые не являются текстом или фото
+async def universal_handler(message: aiog_types.Message, state: FSMContext):
     if not message.photo and not message.text:
         return
 
     user_id = message.from_user.id
     user_data = await get_user_data(user_id)
 
-    # Автоматический старт, если данные утеряны
     if not user_data:
         await message.answer(
-            "⚠️ Сессия утеряна. Давайте восстановим.\nОтправьте имя ассистента заново:",
-            reply_markup=types.ReplyKeyboardRemove()
+            "⚠️ Сессия утеряна. Отправьте имя ассистента заново:",
+            reply_markup=aiog_types.ReplyKeyboardRemove()
         )
         await state.set_state(Registration.waiting_for_bot_name)
         return
 
     bot_name = user_data["bot_name"]
     history = user_data["history"]
-
-    # Определяем режим поиска
     in_search = user_id in search_users
 
-    # Подготовка содержимого для Gemini
-    prompt_parts = [
-        f"Ты — Simul, ИИ-ассистент с именем {bot_name}. "
-        f"{'Сейчас тебя попросили выполнить поиск по запросу.' if in_search else 'Продолжи диалог.'}"
-        f"История диалога:\n{history}"
-    ]
+    persona = f"Ты — Simul, персональный ассистент с именем {bot_name}."
+    if in_search:
+        persona += " Отвечай кратко и только по существу запроса."
 
-    user_text = None
     try:
         if message.photo:
-            # Обработка фото
             photo = message.photo[-1]
             file_info = await bot.get_file(photo.file_id)
             if file_info.file_size and file_info.file_size > MAX_IMAGE_SIZE_MB * 1024 * 1024:
-                await message.answer(f"❌ Изображение слишком большое. Максимум {MAX_IMAGE_SIZE_MB} МБ.")
+                await message.answer(f"❌ Изображение больше {MAX_IMAGE_SIZE_MB} МБ. Уменьшите размер.")
                 return
 
             file_io = io.BytesIO()
@@ -246,41 +229,57 @@ async def universal_handler(message: types.Message, state: FSMContext):
             file_io.seek(0)
             try:
                 img = Image.open(file_io)
-            except Exception as e:
-                logging.error(f"Невозможно открыть изображение: {e}")
-                await message.answer("❌ Не удалось обработать изображение. Попробуйте другой формат.")
+            except Exception:
+                await message.answer("❌ Неподдерживаемый формат изображения.")
                 return
 
             user_text = message.caption if message.caption else "Что на этом фото?"
-            prompt_parts.append(Part.from_image(img))  # Правильная часть изображения
-            prompt_parts.append(f"Пользователь прислал фото и спросил: {user_text}")
+            context_text = (
+                f"{persona}\n\nИстория диалога:\n{history}\n\n"
+                f"Пользователь прислал фото и спрашивает: {user_text}"
+            )
+            contents = [context_text, types.Part.from_image(img)]
+            ai_reply = await ask_gemini(contents)
+            await message.answer(ai_reply, reply_markup=get_main_keyboard())
         else:
             user_text = message.text
-            prompt_parts.append(f"Пользователь: {user_text}")
+            context_text = (
+                f"{persona}\n\nИстория диалога:\n{history}\n\n"
+                f"Пользователь: {user_text}"
+            )
 
-        # Генерация ответа с авто-повтором
-        response = await generate_with_retry(model="gemini-2.0-flash-exp", contents=prompt_parts)
-        ai_reply = response.text.strip()
+            ai_reply = None
+            try:
+                ai_reply = await ask_gemini([context_text])
+            except Exception:
+                logging.exception("Gemini failed, falling back to DeepSeek")
+                try:
+                    messages = [
+                        {"role": "system", "content": persona},
+                        {"role": "user", "content": user_text}
+                    ]
+                    ai_reply = await ask_deepseek(messages)
+                except Exception:
+                    logging.exception("DeepSeek also failed")
+                    await message.answer(
+                        "⚠️ Не удалось получить ответ. Попробуйте позже.",
+                        reply_markup=get_main_keyboard()
+                    )
+                    return
 
-        # Обновление истории (если не фото и не поиск)
-        if not message.photo and not in_search and user_text:
-            new_history = (history + f"\nU: {user_text}\nA: {ai_reply}")[-4000:]
-            await update_user(user_id, history=new_history)
-        elif not in_search:
-            # Фото не заносим в историю, но зато можно добавить краткую информацию
-            logging.info("Фото-запрос обработан без сохранения истории.")
+            if not in_search:
+                new_history = (history + f"\nU: {user_text}\nA: {ai_reply}")[-4000:]
+                await update_user(user_id, history=new_history)
 
-        await message.answer(ai_reply, reply_markup=get_main_keyboard())
+            await message.answer(ai_reply, reply_markup=get_main_keyboard())
 
-    except Exception as e:
-        logging.error(f"Ошибка при генерации ответа: {traceback.format_exc()}")
+    except Exception:
+        logging.exception("Critical error in universal handler")
         await message.answer(
-            "⚠️ Произошла ошибка при обращении к ядру Simul.\n"
-            "Попробуйте ещё раз или введите другой запрос.",
+            "⚠️ Критический сбой. Попробуйте /start.",
             reply_markup=get_main_keyboard()
         )
 
-# --- ЗАПУСК ---
 async def main():
     await init_db()
     await dp.start_polling(bot)

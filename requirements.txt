@@ -2,4 +2,4 @@ aiogram>=3.0
 google-genai
 aiosqlite
 Pillow
-tenacity
+openai
