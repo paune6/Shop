@@ -3,14 +3,14 @@ import logging
 import aiosqlite
 import io
 from PIL import Image
-from google import genai # Новый импорт
+from google import genai
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils.chat_action import ChatActionSender
 
 # --- КОНФИГУРАЦИЯ ---
@@ -55,7 +55,7 @@ async def update_user(user_id, bot_name=None, history=None):
             await db.execute("UPDATE users SET history = ? WHERE user_id = ?", (history, user_id))
         await db.commit()
 
-# --- КЛАВИАТУРА ---
+# --- КЛАВИАТУРЫ ---
 def get_main_menu():
     buttons = [
         [InlineKeyboardButton(text="🗑 Очистить память", callback_data="reset_history")],
@@ -63,6 +63,17 @@ def get_main_menu():
         [InlineKeyboardButton(text="📊 Статус системы", callback_data="sys_status")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_main_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="ℹ️ Информация"), KeyboardButton(text="🗑 Очистить память")],
+            [KeyboardButton(text="⚙️ Изменить имя"), KeyboardButton(text="❓ Помощь")],
+            [KeyboardButton(text="Начать поиск"), KeyboardButton(text="Закончить поиск")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
 
 # --- ИНИЦИАЛИЗАЦИЯ ---
 bot = Bot(token=TG_TOKEN)
@@ -75,22 +86,43 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_data = await get_user_data(message.from_user.id)
     if user_data:
         await message.answer(
-            f"🌟 **Ядро Simul онлайн.**\nВаш персональный ассистент **{user_data[0]}** готов к выполнению задач.",
-            reply_markup=get_main_menu(), parse_mode="Markdown"
+            f"Simul - BM 100\nВаш персональный ассистент **{user_data[0]}** готов к выполнению задач.",
+            reply_markup=get_main_keyboard(), 
+            parse_mode="Markdown"
         )
     else:
-        await message.answer("🦾 **Протокол Инициализации Simul**\n\nЯ — самая мощная ИИ-система в Telegram. Чтобы начать работу, дайте мне уникальное имя:")
+        await message.answer(
+            "🦾 **Протокол Инициализации Simul**\n\nЧтобы начать работу, пожалуйста, отправьте имя, под которым вы хотите общаться с системой:"
+        )
         await state.set_state(Registration.waiting_for_bot_name)
+
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    help_text = (
+        "🤖 **Справка по командам Simul - BM 100:**\n\n"
+        "• `/start` — запустить бота / проверить статус\n"
+        "• `/help` — список всех доступных команд\n\n"
+        "**Функциональные кнопки:**\n"
+        "• *Информация* — вывод статуса системы\n"
+        "• *Очистить память* — сброс истории и контекста\n"
+        "• *Изменить имя* — задать новое имя ассистенту\n"
+        "• *Помощь* — справка по боту\n"
+        "• *Начать поиск / Закончить поиск* — управление поиском"
+    )
+    await message.answer(help_text, parse_mode="Markdown")
 
 @dp.callback_query(F.data == "reset_history")
 async def handle_reset(callback: types.CallbackQuery):
     await update_user(callback.from_user.id, history="")
     await callback.answer("🧠 Память очищена!", show_alert=True)
-    await callback.message.answer("Контекст диалога был сброшен до заводских настроек.")
+    await callback.message.answer(
+        "Контекст диалога был сброшен до заводских настроек.", 
+        reply_markup=get_main_keyboard()
+    )
 
 @dp.callback_query(F.data == "change_name")
 async def handle_change_name(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите новое имя для системы Simul:")
+    await callback.message.answer("Введите новое имя для системы Simul:", reply_markup=types.ReplyKeyboardRemove())
     await state.set_state(Registration.waiting_for_bot_name)
     await callback.answer()
 
@@ -103,11 +135,65 @@ async def handle_sys_status(callback: types.CallbackQuery):
         bot_name, history = user_data
         history_len = len(history) if history else 0
         await callback.answer(
-            f"🟢 Система Simul онлайн\nИмя ассистента: {bot_name}\nИспользование памяти: {history_len} символов", 
+            f"🟢 Система Simul онлайн\nМодель: Simul - BM 100\nИмя ассистента: {bot_name}\nИспользование памяти: {history_len} символов", 
             show_alert=True
         )
     else:
         await callback.answer("❌ Система не инициализирована. Используйте /start.", show_alert=True)
+
+# --- ОБРАБОТЧИКИ КНОПОК КЛАВИАТУРЫ ---
+
+@dp.message(F.text == "ℹ️ Информация")
+async def btn_info(message: types.Message):
+    user_id = message.from_user.id
+    user_data = await get_user_data(user_id)
+    if user_data:
+        bot_name, history = user_data
+        history_len = len(history) if history else 0
+        await message.answer(
+            f"🟢 **Система Simul онлайн**\n\n"
+            f"• **Модель:** Simul - BM 100\n"
+            f"• **Имя ассистента:** {bot_name}\n"
+            f"• **Память:** {history_len} символов",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        await message.answer("❌ Система не инициализирована. Используйте /start.", reply_markup=get_main_keyboard())
+
+@dp.message(F.text == "🗑 Очистить память")
+async def btn_reset(message: types.Message):
+    await update_user(message.from_user.id, history="")
+    await message.answer("🧠 Память очищена! Контекст диалога был сброшен.", reply_markup=get_main_keyboard())
+
+@dp.message(F.text == "⚙️ Изменить имя")
+async def btn_change_name(message: types.Message, state: FSMContext):
+    await message.answer("Введите новое имя для системы Simul:", reply_markup=types.ReplyKeyboardRemove())
+    await state.set_state(Registration.waiting_for_bot_name)
+
+@dp.message(F.text == "❓ Помощь")
+async def btn_help(message: types.Message):
+    await cmd_help(message)
+
+# --- НОВЫЕ ОБРАБОТЧИКИ ПОИСКА ---
+
+@dp.message(F.text == "Начать поиск")
+async def btn_start_search(message: types.Message):
+    await message.answer(
+        "🔍 **Режим поиска активирован.**\nОтправьте ваш запрос, и система выполнит поиск по доступным источникам.",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard()
+    )
+
+@dp.message(F.text == "Закончить поиск")
+async def btn_end_search(message: types.Message):
+    await message.answer(
+        "⏹ **Режим поиска остановлен.**\nВы вернулись к обычному режиму общения с ассистентом.",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard()
+    )
+
+# --- РЕГИСТРАЦИЯ ИМЕНИ ---
 
 @dp.message(Registration.waiting_for_bot_name)
 async def process_reg(message: types.Message, state: FSMContext):
@@ -116,8 +202,8 @@ async def process_reg(message: types.Message, state: FSMContext):
         await update_user(message.from_user.id, bot_name=name)
         await state.clear()
         await message.answer(
-            f"✅ Синхронизация завершена. Приятно познакомиться, я — **{name}**.", 
-            reply_markup=get_main_menu(), 
+            f"✅ Синхронизация завершена.\n\nSimul - BM 100\nПриятно познакомиться, я — **{name}**.", 
+            reply_markup=get_main_keyboard(), 
             parse_mode="Markdown"
         )
     else:
@@ -131,16 +217,16 @@ async def universal_handler(message: types.Message):
     user_data = await get_user_data(user_id)
 
     if not user_data:
-        await message.answer("Пожалуйста, используйте /start для активации системы.")
+        await message.answer("Пожалуйста, используйте /start для активации системы.", reply_markup=types.ReplyKeyboardRemove())
         return
 
     bot_name, history = user_data
-    history = history or ""  # предотвращает ошибку, если history равно None
+    history = history or ""
 
     # Эффект "Печатает..."
     async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
         prompt_parts = [
-            f"Ты — Simul, самая совершенная ИИ-модель. Твоё имя: {bot_name}. Твои ответы всегда точны, глубоки и полезны. "
+            f"Ты — Simul, совершенная ИИ-модель. Твоё имя: {bot_name}. Твои ответы всегда точны, глубоки и полезны. "
             f"Контекст беседы: {history}"
         ]
 
@@ -176,10 +262,10 @@ async def universal_handler(message: types.Message):
                 new_history = (history + f"\nU: {message.text}\nA: {ai_reply}")[-3000:]
                 await update_user(user_id, history=new_history)
 
-            await message.answer(ai_reply, parse_mode="Markdown", reply_markup=get_main_menu())
+            await message.answer(ai_reply, parse_mode="Markdown", reply_markup=get_main_keyboard())
         except Exception as e:
             logging.error(f"Error: {e}")
-            await message.answer("⚠️ Произошел системный сбой в ядре Simul. Попробуйте другой запрос.")
+            await message.answer("⚠️ Произошел системный сбой в ядре Simul. Попробуйте другой запрос.", reply_markup=get_main_keyboard())
 
 async def main():
     await init_db()
