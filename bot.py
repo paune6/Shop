@@ -52,6 +52,8 @@ async def update_user(user_id, bot_name=None, history=None):
                 VALUES (?, ?, COALESCE((SELECT history FROM users WHERE user_id = ?), ''))
             """, (user_id, bot_name, user_id))
         if history is not None:
+            # Гарантируем существование строки перед UPDATE
+            await db.execute("INSERT OR IGNORE INTO users (user_id, bot_name, history) VALUES (?, '', '')", (user_id,))
             await db.execute("UPDATE users SET history = ? WHERE user_id = ?", (history, user_id))
         await db.commit()
 
@@ -69,7 +71,8 @@ def get_main_keyboard():
         keyboard=[
             [KeyboardButton(text="ℹ️ Информация"), KeyboardButton(text="🗑 Очистить память")],
             [KeyboardButton(text="⚙️ Изменить имя"), KeyboardButton(text="❓ Помощь")],
-            [KeyboardButton(text="Начать поиск"), KeyboardButton(text="Закончить поиск")]
+            [KeyboardButton(text="Начать поиск"), KeyboardButton(text="Закончить поиск")],
+            [KeyboardButton(text="📊 Статус системы")]
         ],
         resize_keyboard=True,
         one_time_keyboard=False
@@ -85,14 +88,14 @@ dp = Dispatcher(storage=MemoryStorage())
 async def cmd_start(message: types.Message, state: FSMContext):
     user_data = await get_user_data(message.from_user.id)
     if user_data:
+        # Без parse_mode — избегаем сбоев из-за спецсимволов в имени
         await message.answer(
-            f"Simul - BM 100\nВаш персональный ассистент **{user_data[0]}** готов к выполнению задач.",
-            reply_markup=get_main_keyboard(), 
-            parse_mode="Markdown"
+            f"Simul - BM 100\nВаш персональный ассистент {user_data[0]} готов к выполнению задач.",
+            reply_markup=get_main_keyboard()
         )
     else:
         await message.answer(
-            "🦾 **Протокол Инициализации Simul**\n\nЧтобы начать работу, пожалуйста, отправьте имя, под которым вы хотите общаться с системой:"
+            "🦾 Протокол Инициализации Simul\n\nЧтобы начать работу, пожалуйста, отправьте имя, под которым вы хотите общаться с системой:"
         )
         await state.set_state(Registration.waiting_for_bot_name)
 
@@ -107,7 +110,8 @@ async def cmd_help(message: types.Message):
         "• *Очистить память* — сброс истории и контекста\n"
         "• *Изменить имя* — задать новое имя ассистенту\n"
         "• *Помощь* — справка по боту\n"
-        "• *Начать поиск / Закончить поиск* — управление поиском"
+        "• *Начать поиск / Закончить поиск* — управление поиском\n"
+        "• *Статус системы* — просмотр состояния ядра"
     )
     await message.answer(help_text, parse_mode="Markdown")
 
@@ -130,10 +134,10 @@ async def handle_change_name(callback: types.CallbackQuery, state: FSMContext):
 async def handle_sys_status(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     user_data = await get_user_data(user_id)
-    
     if user_data:
         bot_name, history = user_data
         history_len = len(history) if history else 0
+        # alert не поддерживает Markdown — безопасно
         await callback.answer(
             f"🟢 Система Simul онлайн\nМодель: Simul - BM 100\nИмя ассистента: {bot_name}\nИспользование памяти: {history_len} символов", 
             show_alert=True
@@ -150,12 +154,12 @@ async def btn_info(message: types.Message):
     if user_data:
         bot_name, history = user_data
         history_len = len(history) if history else 0
+        # Обычный текст без форматирования, чтобы избежать краша из-за спецсимволов
         await message.answer(
-            f"🟢 **Система Simul онлайн**\n\n"
-            f"• **Модель:** Simul - BM 100\n"
-            f"• **Имя ассистента:** {bot_name}\n"
-            f"• **Память:** {history_len} символов",
-            parse_mode="Markdown",
+            f"🟢 Система Simul онлайн\n\n"
+            f"• Модель: Simul - BM 100\n"
+            f"• Имя ассистента: {bot_name}\n"
+            f"• Память: {history_len} символов",
             reply_markup=get_main_keyboard()
         )
     else:
@@ -175,23 +179,39 @@ async def btn_change_name(message: types.Message, state: FSMContext):
 async def btn_help(message: types.Message):
     await cmd_help(message)
 
-# --- НОВЫЕ ОБРАБОТЧИКИ ПОИСКА ---
-
 @dp.message(F.text == "Начать поиск")
 async def btn_start_search(message: types.Message):
     await message.answer(
-        "🔍 **Режим поиска активирован.**\nОтправьте ваш запрос, и система выполнит поиск по доступным источникам.",
-        parse_mode="Markdown",
+        "🔍 Режим поиска активирован.\nОтправьте ваш запрос, и система выполнит поиск по доступным источникам.",
         reply_markup=get_main_keyboard()
     )
 
 @dp.message(F.text == "Закончить поиск")
 async def btn_end_search(message: types.Message):
     await message.answer(
-        "⏹ **Режим поиска остановлен.**\nВы вернулись к обычному режиму общения с ассистентом.",
-        parse_mode="Markdown",
+        "⏹ Режим поиска остановлен.\nВы вернулись к обычному режиму общения с ассистентом.",
         reply_markup=get_main_keyboard()
     )
+
+@dp.message(F.text == "📊 Статус системы")
+async def btn_sys_status(message: types.Message):
+    user_id = message.from_user.id
+    user_data = await get_user_data(user_id)
+    if user_data:
+        bot_name, history = user_data
+        history_len = len(history) if history else 0
+        await message.answer(
+            f"🟢 Система Simul онлайн\n\n"
+            f"• Модель: Simul - BM 100\n"
+            f"• Имя ассистента: {bot_name}\n"
+            f"• Память: {history_len} символов",
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        await message.answer(
+            "❌ Система не инициализирована. Используйте /start.",
+            reply_markup=get_main_keyboard()
+        )
 
 # --- РЕГИСТРАЦИЯ ИМЕНИ ---
 
@@ -201,10 +221,10 @@ async def process_reg(message: types.Message, state: FSMContext):
         name = message.text.strip()[:20]
         await update_user(message.from_user.id, bot_name=name)
         await state.clear()
+        # Без Markdown – имя пользователя не сломает сообщение
         await message.answer(
-            f"✅ Синхронизация завершена.\n\nSimul - BM 100\nПриятно познакомиться, я — **{name}**.", 
-            reply_markup=get_main_keyboard(), 
-            parse_mode="Markdown"
+            f"✅ Синхронизация завершена.\n\nSimul - BM 100\nПриятно познакомиться, я — {name}.", 
+            reply_markup=get_main_keyboard()
         )
     else:
         await message.answer("Пожалуйста, отправьте текст для имени системы.")
@@ -213,6 +233,10 @@ async def process_reg(message: types.Message, state: FSMContext):
 
 @dp.message()
 async def universal_handler(message: types.Message):
+    # Игнорируем сообщения, которые не являются текстом или фото (стикеры, документы и т.д.)
+    if not message.photo and not message.text:
+        return
+
     user_id = message.from_user.id
     user_data = await get_user_data(user_id)
 
@@ -257,12 +281,13 @@ async def universal_handler(message: types.Message):
             )
             ai_reply = response.text
 
-            # Обновление истории (только для текста)
+            # Обновление истории (только для текстовых сообщений без фото)
             if not message.photo and message.text:
                 new_history = (history + f"\nU: {message.text}\nA: {ai_reply}")[-3000:]
                 await update_user(user_id, history=new_history)
 
-            await message.answer(ai_reply, parse_mode="Markdown", reply_markup=get_main_keyboard())
+            # Ответ отправляем как обычный текст — ИИ-вывод не ломает парсинг
+            await message.answer(ai_reply, reply_markup=get_main_keyboard())
         except Exception as e:
             logging.error(f"Error: {e}")
             await message.answer("⚠️ Произошел системный сбой в ядре Simul. Попробуйте другой запрос.", reply_markup=get_main_keyboard())
