@@ -2,12 +2,14 @@ import asyncio
 import logging
 import aiosqlite
 import io
+import os
 from datetime import datetime
 from PIL import Image
 
-# Библиотеки ИИ
+# Модели и Поиск
 from google import genai
 from google.genai import types
+from tavily import AsyncTavilyClient
 from duckduckgo_search import DDGS
 
 # Aiogram
@@ -20,7 +22,7 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils.chat_action import ChatActionSender
 
 # ========== КОНФИГУРАЦИЯ ==========
-API_KEYS = {
+KEYS = {
     "TG": "8757845092:AAHK3sKNbzy-w7_4oBgHF7p9sYeNGxIXEic",
     "GEMINI": "AIzaSyDJAiv1aUdtqWv8qbMyvuXhfztCJTSQBtU",
     "TAVILY": "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"
@@ -29,20 +31,48 @@ API_KEYS = {
 DB_PATH = "simul_core.db"
 GEMINI_MODEL = "gemini-1.5-flash"
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("SimulBM100")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("SimulSearch")
 
 # ========== КЛИЕНТЫ ==========
-client = genai.Client(api_key=API_KEYS["GEMINI"])
+gemini_client = genai.Client(api_key=KEYS["GEMINI"])
+tavily_client = AsyncTavilyClient(api_key=KEYS["TAVILY"])
 
-try:
-    from tavily import AsyncTavilyClient
-    tavily_api = AsyncTavilyClient(api_key=API_KEYS["TAVILY"])
-except:
-    tavily_api = None
+# ========== УЛЬТИМАТИВНЫЙ ПОИСК ==========
+async def get_simul_knowledge(query: str):
+    """Функция гарантированного получения данных из сети"""
+    search_data = ""
+    
+    # 1. Сначала пробуем Tavily (самый надежный API)
+    try:
+        logger.info(f"🔎 Tavily ищет: {query}")
+        t_res = await asyncio.wait_for(
+            tavily_client.search(query=query, search_depth="basic", max_results=4),
+            timeout=8.0
+        )
+        for r in t_res.get("results", []):
+            search_data += f"Источник: {r['title']}\nКонтент: {r['content']}\n\n"
+    except Exception as e:
+        logger.warning(f"Tavily failed: {e}")
+
+    # 2. Если Tavily пуст, пробуем DuckDuckGo (через поток, чтобы не вис хостинг)
+    if not search_data.strip():
+        try:
+            logger.info(f"🔎 DDG ищет: {query}")
+            def ddg_sync():
+                with DDGS() as ddgs:
+                    return [r for r in ddgs.text(query, max_results=3)]
+            
+            ddg_res = await asyncio.to_thread(ddg_sync)
+            for r in ddg_res:
+                search_data += f"Источник: {r['title']}\nКонтент: {r['body']}\n\n"
+        except Exception as e:
+            logger.error(f"DDG failed: {e}")
+
+    return search_data.strip()
 
 # ========== БАЗА ДАННЫХ ==========
-async def init_db():
+async def db_init():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -53,122 +83,101 @@ async def init_db():
             )""")
         await db.commit()
 
-async def get_user_data(uid):
+async def db_get_user(uid):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT name, history, search_on FROM users WHERE id=?", (uid,)) as c:
             row = await c.fetchone()
-            if row:
-                return {"name": row[0], "history": row[1] or "", "search_on": bool(row[2])}
+            if row: return {"name": row[0], "history": row[1] or "", "search": bool(row[2])}
             return None
 
-# ========== МОДУЛЬ ПОИСКА ==========
-def sync_ddg_search(query):
-    """Синхронный поиск DuckDuckGo (запускается в потоке)"""
-    try:
-        with DDGS() as ddgs:
-            results = [r for r in ddgs.text(query, max_results=3)]
-            return "\n".join([f"- {r['title']}: {r['body']}" for r in results])
-    except:
-        return ""
-
-async def run_combined_search(query: str):
-    """Сначала Tavily, потом DDG"""
-    search_text = ""
-    # 1. Пробуем официальный API Tavily
-    if tavily_api:
-        try:
-            t_res = await tavily_api.search(query=query, search_depth="basic", max_results=3)
-            for r in t_res.get("results", []):
-                search_text += f"• {r['title']}: {r['content']}\n"
-        except: pass
-    
-    # 2. Если пусто, пробуем DDG
-    if not search_text:
-        search_text = await asyncio.to_thread(sync_ddg_search, query)
-    
-    return search_text if search_text else "Информация в сети не найдена."
-
 # ========== КЛАВИАТУРА ==========
-def main_kb(search_status: bool):
-    btn_search = "⏹ Поиск: ВЫКЛ" if search_status else "🔍 Поиск: ВКЛ"
+def main_kb(s_status: bool):
+    s_btn = "⏹ Поиск: ВЫКЛ" if s_status else "🔍 Поиск: ВКЛ"
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="ℹ️ Инфо"), KeyboardButton(text="🗑 Очистить память")],
-            [KeyboardButton(text=btn_search)],
-            [KeyboardButton(text="⚙️ Изменить имя")]
+            [KeyboardButton(text="ℹ️ Инфо"), KeyboardButton(text="🗑 Очистка")],
+            [KeyboardButton(text=s_btn)],
+            [KeyboardButton(text="⚙️ Сменить имя")]
         ], resize_keyboard=True
     )
 
-# ========== ЛОГИКА АЙОГРАМ ==========
-bot = Bot(token=API_KEYS["TG"])
+bot = Bot(token=KEYS["TG"])
 dp = Dispatcher(storage=MemoryStorage())
 
 class Reg(StatesGroup):
     name = State()
 
+# ========== ОБРАБОТЧИКИ ==========
 @dp.message(Command("start"))
 async def cmd_start(message: aiog_types.Message, state: FSMContext):
     await state.clear()
-    user = await get_user_data(message.from_user.id)
+    user = await db_get_user(message.from_user.id)
     if user:
-        await message.answer(f"🦾 Simul онлайн. Привет, {user['name']}!", reply_markup=main_kb(user['search_on']))
+        await message.answer(f"🦾 Simul онлайн. Привет, {user['name']}.", reply_markup=main_kb(user['search']))
     else:
-        await message.answer("🦾 Протокол инициализации Simul.\nВведите ваше имя:")
+        await message.answer("🦾 Инициализация Simul BM-100.\nВведите ваше имя:")
         await state.set_state(Reg.name)
 
 @dp.message(Reg.name)
-async def process_reg(message: aiog_types.Message, state: FSMContext):
-    name = message.text.strip()[:20] if message.text else "User"
+async def process_name(message: aiog_types.Message, state: FSMContext):
+    name = message.text.strip()[:20] if message.text else "Пользователь"
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT INTO users (id, name, history, search_on) VALUES (?, ?, '', 0) ON CONFLICT(id) DO UPDATE SET name=?", (message.from_user.id, name, name))
         await db.commit()
     await state.clear()
-    await message.answer(f"✅ Принято, {name}. Я готов к работе.", reply_markup=main_kb(False))
+    await message.answer(f"✅ Имя {name} принято.", reply_markup=main_kb(False))
 
 @dp.message(F.text.contains("Поиск:"))
 async def toggle_search(message: aiog_types.Message):
-    user = await get_user_data(message.from_user.id)
-    if not user: return
-    new_val = 0 if user['search_on'] else 1
+    user = await db_get_user(message.from_user.id)
+    new_s = 0 if user['search'] else 1
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET search_on=? WHERE id=?", (new_val, message.from_user.id))
+        await db.execute("UPDATE users SET search_on=? WHERE id=?", (new_s, message.from_user.id))
         await db.commit()
-    await message.answer(f"✅ Поиск {'ВКЛЮЧЕН' if new_val else 'ВЫКЛЮЧЕН'}.", reply_markup=main_kb(bool(new_val)))
+    await message.answer(f"✅ Поиск {'ВКЛЮЧЕН' if new_s else 'ВЫКЛЮЧЕН'}.", reply_markup=main_kb(bool(new_s)))
 
-@dp.message(F.text == "🗑 Очистить память")
-async def clear_hist(message: aiog_types.Message):
+@dp.message(F.text == "🗑 Очистка")
+async def clear_mem(message: aiog_types.Message):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET history='' WHERE id=?", (message.from_user.id,))
         await db.commit()
-    await message.answer("🧠 Память очищена.")
+    await message.answer("🧠 Память сброшена.")
 
 @dp.message()
-async def universal_handler(message: aiog_types.Message, state: FSMContext):
+async def main_handler(message: aiog_types.Message, state: FSMContext):
     uid = message.from_user.id
-    user = await get_user_data(uid)
+    user = await db_get_user(uid)
     if not user: return
-    
-    # Обработка кнопок Инфо и Имя
-    if message.text == "ℹ️ Инфо":
-        return await message.answer(f"🤖 Simul BM-100\n👤 Имя: {user['name']}\n🧠 Память: {len(user['history'])} симв.")
-    if message.text == "⚙️ Изменить имя":
-        await message.answer("Введите новое имя:")
-        return await state.set_state(Reg.name)
+
+    # Игнор служебных кнопок
+    if message.text in ["ℹ️ Инфо", "⚙️ Сменить имя"]:
+        if message.text == "ℹ️ Инфо":
+            await message.answer(f"👤 Имя: {user['name']}\n🌍 Режим поиска: {'ВКЛ' if user['search'] else 'ВЫКЛ'}")
+        return
 
     async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        user_input = message.text or message.caption or ""
-        search_data = ""
+        query = message.text or message.caption or ""
+        knowledge = ""
         
-        # Умный запуск поиска
-        if user['search_on'] or any(word in user_input.lower() for word in ["кто", "что", "где", "когда", "новости", "курс"]):
-            if user_input: search_data = await run_combined_search(user_input)
+        # 1. ПРОВЕРКА НЕОБХОДИМОСТИ ПОИСКА
+        triggers = ["кто", "что", "где", "курс", "новости", "цена", "сколько", "когда"]
+        need_search = user['search'] or any(t in query.lower() for t in triggers)
+        
+        if need_search and query:
+            knowledge = await get_simul_knowledge(query)
 
-        # Инструкция для ИИ
-        sys_prompt = f"Ты — Simul, ассистент пользователя {user['name']}. Будь полезен и точен."
-        full_context = f"{sys_prompt}\n\nИстория:\n{user['history']}\n\nДАННЫЕ ИЗ СЕТИ:\n{search_data}\n\nЗапрос: {user_input}\nОтвет:"
+        # 2. ФОРМИРОВАНИЕ УЛЬТИМАТИВНОГО ПРОМПТА
+        sys_instr = (
+            f"Ты — Simul, ИИ-ассистент пользователя {user['name']}. "
+            f"Сегодняшняя дата: {datetime.now().strftime('%d.%m.%Y')}. "
+            "ИНСТРУКЦИЯ: Ниже приведены данные из интернета. Ты ОБЯЗАН использовать их для ответа на вопрос пользователя. "
+            "Если данных нет в блоке поиска, используй свои знания."
+        )
+
+        full_prompt = f"{sys_instr}\n\n[БЛОК ПОИСКА]:\n{knowledge}\n\n[ИСТОРИЯ]:\n{user['history']}\n\n[ВОПРОС]: {query}"
 
         try:
-            # Если ФОТО
+            # 3. ОБРАБОТКА ФОТО
             if message.photo:
                 photo = message.photo[-1]
                 p_file = await bot.get_file(photo.file_id)
@@ -176,41 +185,44 @@ async def universal_handler(message: aiog_types.Message, state: FSMContext):
                 img = Image.open(p_data).convert("RGB")
                 img.thumbnail((1024, 1024))
                 img_io = io.BytesIO()
-                img.save(img_io, format="JPEG", quality=80)
+                img.save(img_io, format="JPEG", quality=85)
                 
-                res = await client.aio.models.generate_content(
+                resp = await gemini_client.aio.models.generate_content(
                     model=GEMINI_MODEL,
-                    contents=[f"{sys_prompt}\n{user_input}", types.Part.from_bytes(data=img_io.getvalue(), mime_type="image/jpeg")]
+                    contents=[f"{sys_instr}\n{query}", types.Part.from_bytes(data=img_io.getvalue(), mime_type="image/jpeg")]
                 )
-                ai_reply = res.text
-            # Если ТЕКСТ
+                reply = resp.text
+            # 4. ТЕКСТОВЫЙ ЗАПРОС
             else:
-                res = await client.aio.models.generate_content(model=GEMINI_MODEL, contents=full_context)
-                ai_reply = res.text
+                resp = await gemini_client.aio.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=full_prompt
+                )
+                reply = resp.text
         except Exception as e:
-            logger.error(f"AI Error: {e}")
-            ai_reply = "⚠️ Модель временно недоступна. Попробуйте переформулировать запрос."
+            logger.error(f"Gemini error: {e}")
+            reply = "⚠️ Модель временно недоступна. Попробуйте еще раз."
 
-        if ai_reply:
-            # Сохранение истории (последние 3000 симв)
-            new_h = (user['history'] + f"\nU: {user_input}\nA: {ai_reply}")[-3000:]
+        if reply:
+            # Сохранение в историю (лимит 3000 симв)
+            new_h = (user['history'] + f"\nU: {query}\nA: {reply}")[-3000:]
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE users SET history=? WHERE id=?", (new_h, uid))
                 await db.commit()
             
-            # Отправка
-            final_resp = ("🌐 [SEARCH MODE]\n\n" + ai_reply) if search_data else ai_reply
-            for i in range(0, len(final_resp), 4000):
-                await message.answer(final_resp[i:i+4000], reply_markup=main_kb(user['search_on']))
+            # Если был поиск, добавим визуальный индикатор
+            if knowledge:
+                reply = "🌐 [Simul Search Active]\n\n" + reply
+
+            for i in range(0, len(reply), 4000):
+                await message.answer(reply[i:i+4000], reply_markup=main_kb(user['search']))
 
 async def main():
-    await init_db()
+    await db_init()
+    # Жесткий сброс для предотвращения ConflictError
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("--- БОТ ЗАПУЩЕН ---")
+    logger.info("--- SIMUL BM-100 УСПЕШНО ЗАПУЩЕН ---")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except:
-        pass
+    asyncio.run(main())
